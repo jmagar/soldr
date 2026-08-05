@@ -274,7 +274,17 @@ pub(crate) fn probe_rustlib_integrity() -> ProbeResult {
             };
         }
     };
-    let toolchain_root = match query_rustc_sysroot(&rustc) {
+    // soldr#1341: `rustc --print sysroot` and `rustup target list
+    // --installed` must agree on which RUSTUP_HOME they read, or the
+    // probe compares a sysroot from one toolchain home against the
+    // installed-target list from a different one and flags every
+    // target as corrupt. Pin both calls to the same explicit
+    // RUSTUP_HOME up front (falling back to whatever each call would
+    // have resolved implicitly if Soldr's managed home isn't
+    // available) so the comparison is always apples-to-apples.
+    let rustup_home_override = managed_rustup_home_override();
+
+    let toolchain_root = match query_rustc_sysroot(&rustc, rustup_home_override.as_deref()) {
         Ok(path) => path,
         Err(reason) => {
             return ProbeResult {
@@ -289,7 +299,7 @@ pub(crate) fn probe_rustlib_integrity() -> ProbeResult {
         }
     };
 
-    let installed = match rustup_installed_targets_active() {
+    let installed = match rustup_installed_targets_active(rustup_home_override.as_deref()) {
         Ok(targets) => targets,
         Err(err) => {
             return ProbeResult {
@@ -349,15 +359,38 @@ pub(crate) fn probe_rustlib_integrity() -> ProbeResult {
     }
 }
 
+/// Resolve the RUSTUP_HOME both halves of the rustlib-integrity probe
+/// (`query_rustc_sysroot` and `rustup_installed_targets_active`) should pin
+/// to, so a sysroot query and an installed-target listing can't silently
+/// read from two different toolchain homes. `None` means Soldr's managed
+/// home isn't available and each call should fall back to its own default
+/// resolution (which still agrees in the common case where nothing is
+/// managed).
+fn managed_rustup_home_override() -> Option<PathBuf> {
+    let paths = crate::core::SoldrPaths::new().ok()?;
+    let managed = crate::fetch::managed_rustup_home(&paths);
+    managed.is_dir().then_some(managed)
+}
+
 /// Ask the resolved compiler for its sysroot instead of deriving it from the
 /// executable path. `resolve_toolchain_binary("rustc")` can legitimately
 /// return a soldr/rustup shim under `CARGO_HOME/bin`; the shim's parent is not
 /// the active toolchain root and treating it as one makes every installed
 /// target look corrupt.
-fn query_rustc_sysroot(rustc: &Path) -> Result<PathBuf, String> {
+///
+/// `rustup_home_override`, when set, is applied *after* the normal resolved
+/// homes so this and `rustup_installed_targets_active` agree on which
+/// RUSTUP_HOME they read (soldr#1341).
+fn query_rustc_sysroot(
+    rustc: &Path,
+    rustup_home_override: Option<&Path>,
+) -> Result<PathBuf, String> {
     let mut command = std::process::Command::new(rustc);
     command.args(["--print", "sysroot"]);
-    crate::binaries::apply_implicit_toolchain_homes(&mut command);
+    crate::binaries::apply_resolved_toolchain_homes(&mut command, rustc);
+    if let Some(rustup_home) = rustup_home_override {
+        command.env(crate::core::RUSTUP_HOME_ENV_VAR, rustup_home);
+    }
     suppress_windows_console_window(&mut command);
     let output =
         command_output_with_timeout(&mut command, "rustc --print sysroot").map_err(|err| {
@@ -438,10 +471,19 @@ fn classify_rustlib_lib_dir(lib_dir: &Path) -> RustlibLibDirStatus {
 /// against whichever toolchain `rustup which rustc` just resolved
 /// against — the two calls agree by construction because we let rustup
 /// decide the toolchain in both cases.
-fn rustup_installed_targets_active() -> Result<Vec<String>, SoldrError> {
+///
+/// `rustup_home_override`, when set, is applied *after* the normal
+/// implicit homes so this and `query_rustc_sysroot` agree on which
+/// RUSTUP_HOME they read (soldr#1341).
+fn rustup_installed_targets_active(
+    rustup_home_override: Option<&Path>,
+) -> Result<Vec<String>, SoldrError> {
     let mut command = std::process::Command::new(crate::binaries::rustup_binary());
     command.args(["target", "list", "--installed"]);
     crate::binaries::apply_implicit_toolchain_homes(&mut command);
+    if let Some(rustup_home) = rustup_home_override {
+        command.env(crate::core::RUSTUP_HOME_ENV_VAR, rustup_home);
+    }
     suppress_windows_console_window(&mut command);
     let output = command_output_with_timeout(&mut command, "rustup target list --installed")?;
     if !output.status.success() {
