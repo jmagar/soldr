@@ -235,7 +235,13 @@ pub async fn prepare(paths: &SoldrPaths, target_triple: &str) -> Result<BlessedP
         {
             prep.path_dirs.push(bundle.join("bin"));
         }
-        ensure_dsymutil_on_path(&mut prep)?;
+        if let Err(e) = ensure_dsymutil_on_path(&mut prep) {
+            eprintln!("soldr build: dsymutil unavailable for {target_triple}: {e}");
+            eprintln!(
+                "soldr build: continuing without a provisioned dsymutil; \
+                 packed Darwin debuginfo may fail to link if rustc invokes it"
+            );
+        }
 
         // Apple SDK fetch is the same code path `soldr prepare` uses,
         // so this is reuse rather than new logic.
